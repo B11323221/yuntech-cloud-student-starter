@@ -1,40 +1,68 @@
-#!/usr/bin/env python3
-"""W3 supplied inspection-service prototype; extend routes in later Sprints."""
-from datetime import datetime, timezone
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-import json
-from pathlib import Path
-import re
+from fastapi import FastAPI, Depends, HTTPException, Header, status
+from pydantic import BaseModel
+import os
+import psycopg2
+from psycopg2.extras import RealDictCursor
 
+app = FastAPI()
 
-def make_server(version_file, port=8080):
-    version = Path(version_file).read_text(encoding="utf-8").strip()
-    if not re.fullmatch(r"[0-9a-f]{40}", version):
-        raise ValueError("version must contain the deployed 40-character Git commit SHA")
-    started = datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+DB_HOST = os.getenv("DB_HOST", "localhost")
+DB_NAME = os.getenv("DB_NAME", "inspection")
+DB_USER = os.getenv("DB_USER", "postgres")
+DB_PASSWORD = os.getenv("DB_PASSWORD", "postgres")
+REPORTER_TOKEN = os.getenv("REPORTER_TOKEN", "secret-token")
+VALID_DEVICE_IDS = os.getenv("IOT_DEVICE_IDS", "").split(",")
 
-    class Handler(BaseHTTPRequestHandler):
-        def setup(self):
-            super().setup()
-            self.connection.settimeout(5)
+def get_db():
+    conn = psycopg2.connect(
+        host=DB_HOST,
+        database=DB_NAME,
+        user=DB_USER,
+        password=DB_PASSWORD,
+        cursor_factory=RealDictCursor
+    )
+    try:
+        yield conn
+    finally:
+        conn.close()
 
-        def do_GET(self):
-            ok = self.path == "/health"
-            body = {"status": "ok", "service": "inspection", "version": version,
-                    "started_at": started} if ok else {"error": "not_found"}
-            data = json.dumps(body).encode("utf-8")
-            self.send_response(200 if ok else 404)
-            self.send_header("Content-Type", "application/json; charset=utf-8")
-            self.send_header("Content-Length", str(len(data)))
-            self.send_header("Cache-Control", "no-store")
-            self.end_headers()
-            self.wfile.write(data)
+def verify_token(authorization: str = Header(...)):
+    try:
+        scheme, token = authorization.split()
+        if scheme.lower() != "bearer" or token != REPORTER_TOKEN:
+            raise HTTPException(status_code=401, detail="Invalid token")
+    except ValueError:
+        raise HTTPException(status_code=401, detail="Invalid authorization header")
 
-        def log_message(self, fmt, *args):
-            pass  # Never log request paths, bodies, headers or query strings.
+@app.get("/health")
+def health_check():
+    return {"status": "ok", "service": "inspection"}
 
-    return ThreadingHTTPServer(("127.0.0.1", port), Handler)
+class EventPayload(BaseModel):
+    event_id: str
+    device_id: str
+    timestamp: str
+    data: dict = {}
 
+@app.post("/events", status_code=201)
+def create_event(payload: EventPayload, db = Depends(get_db), _ = Depends(verify_token)):
+    if VALID_DEVICE_IDS and payload.device_id not in VALID_DEVICE_IDS:
+        raise HTTPException(status_code=400, detail="Device not allowed")
 
-if __name__ == "__main__":
-    make_server(Path(__file__).with_name("version")).serve_forever()
+    cursor = db.cursor()
+    try:
+        cursor.execute("SELECT event_id FROM events WHERE event_id = %s", (payload.event_id,))
+        if cursor.fetchone():
+            return {"status": "duplicate", "event_id": payload.event_id}
+
+        cursor.execute(
+            "INSERT INTO events (event_id, device_id, timestamp, data) VALUES (%s, %s, %s, %s)",
+            (payload.event_id, payload.device_id, payload.timestamp, psycopg2.extras.Json(payload.data))
+        )
+        db.commit()
+        return {"status": "created", "event_id": payload.event_id}
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        cursor.close()
